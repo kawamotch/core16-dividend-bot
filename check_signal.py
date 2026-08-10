@@ -49,15 +49,12 @@ PBR_RANGE_PATH = DATA_CACHE / "irbank_pbr_range.json"
 DIVIDEND_HISTORY_PATH = DATA_CACHE / "irbank_dividend_history.json"
 STALENESS_DAYS = 25  # PBR/配当レンジデータ（四半期更新）を再取得しなおすまでの許容日数
 
-# 配当利回りの異常値ガード（2026-08-10発覚）: bot/irbank_dividend.adjust_dividends_for_splits()は
-# 1期に複数回の分割が絡む・期の途中で分割が起きる（分割前の中間配当＋分割後の期末配当が
-# 単純合算される）ケースを正しく補正できず、実際にはあり得ない極端な利回りを生むことがある
-# （実例: 伊藤忠2025-12の1:5分割をまたいだ期で利回り9.6%という非現実的な値になった）。
-# 根本修正は共有モジュール(bot/irbank_dividend.py)の変更が必要でユーザー確認が必要なため、
-# 応急処置としてこの閾値を超える利回りは「要確認」として扱い、AND条件の判定対象からも除外する
-# （誤った高利回りで実際より魅力的に見せてしまう事故を防ぐ。閾値8%はコア16銘柄の実勢利回り
-# （軒並み1〜5%程度）から見て十分に非現実的な水準）。
-YIELD_OUTLIER_CEILING_PCT = 8.0
+# 配当利回りの異常値ガード（分割またぎ等でのデータ異常対策）は、build_dividend_yield_series()
+# （backtest_dividend_yield_filter.py、YIELD_OUTLIER_CEILING_PCT）側に一本化済み（2026-08-10）。
+# この関数はcheck_signal.py・backtest_dividend_relative_yield_filter.py双方から共有されるため、
+# 呼び出し元であるここでは異常値は既にNaN化された後の値しか渡ってこない（「利回り不明」と
+# 同じ扱いになる。データが本当に無いのか、異常値として弾かれたのかを呼び出し元で区別する
+# 必要が生じたら、その時にYIELD_OUTLIER_CEILING_PCTをここでもimportして使う）。
 
 
 def _load_last_checked_date() -> str | None:
@@ -170,14 +167,8 @@ def main() -> int:
     name_by_code = {t["code"]: t["name"] for t in CORE16_UNIVERSE}
 
     def _clean_yield(raw_val) -> float | None:
-        """NaN→None。異常値（YIELD_OUTLIER_CEILING_PCT超）もNone扱いにする
-        （分割またぎ等でのデータ異常を「利回り基準を満たさない」と同じ安全側に倒す。
-        表示上は_fmt_yieldが元の値と要確認マークを別途出すため、ここではAND条件判定・
-        現在値表示用の値そのものをNoneにはしない。代わりに呼び出し側でoutlier判定を都度行う）。"""
+        """NaN→None（build_dividend_yield_series側で異常値は既にNaN化済み）。"""
         return float(raw_val) if pd.notna(raw_val) else None
-
-    def _is_outlier(y: float | None) -> bool:
-        return y is not None and y > YIELD_OUTLIER_CEILING_PCT
 
     for code, sig in signals.items():
         valid = sig.dropna(subset=["range_position_pct"])
@@ -193,7 +184,7 @@ def main() -> int:
         def _event_row(ev_date: pd.Timestamp) -> tuple[str, str, pd.Timestamp, float, float | None, bool]:
             range_pct = float(valid["range_position_pct"].loc[ev_date])
             yield_pct = _clean_yield(sig["dividend_yield_pct"].loc[ev_date])
-            and_met = yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT and not _is_outlier(yield_pct)
+            and_met = yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT
             return (code, name_by_code[code], ev_date, range_pct, yield_pct, and_met)
 
         if is_first_run:
@@ -207,11 +198,7 @@ def main() -> int:
                     new_events.append(_event_row(ev_date))
 
     def _fmt_yield(y: float | None) -> str:
-        if y is None:
-            return "利回り不明"
-        if _is_outlier(y):
-            return f"利回り{y:.1f}%[要確認: 分割またぎの可能性、AND条件対象外]"
-        return f"利回り{y:.1f}%"
+        return f"利回り{y:.1f}%" if y is not None else "利回り不明"
 
     # 2026-08-10フルレビューの合意: 「レンジ30%以下 かつ 利回り3%以上」のAND条件は
     # ウォークフォワードOOSで単体基準を上回った最有望な部分集合として強調表示する。
@@ -234,11 +221,7 @@ def main() -> int:
     print(f"\n=== 現在のレンジ位置・配当利回り（全16銘柄、参考） ===")
     for code, name, pct, yield_pct in sorted(current_status, key=lambda x: (x[2] is None, x[2] if x[2] is not None else 999)):
         pct_str = f"{pct:.1f}%" if pct is not None else "算出不能"
-        and_met = (
-            pct is not None and pct <= THRESHOLD_PCT
-            and yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT
-            and not _is_outlier(yield_pct)
-        )
+        and_met = pct is not None and pct <= THRESHOLD_PCT and yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT
         marker = " ★★AND条件成立" if and_met else (" ★割安ゾーン" if pct is not None and pct <= THRESHOLD_PCT else "")
         print(f"  {code} {name:10s}  レンジ={pct_str:>7}  {_fmt_yield(yield_pct):>10}{marker}")
 

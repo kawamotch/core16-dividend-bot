@@ -42,6 +42,18 @@ DIVIDEND_DISCLOSURE_LAG_DAYS = 45  # bot/pbr_signal.DISCLOSURE_LAG_DAYSと同じ
 RANDOM_BASELINE_TRIALS = 20
 RANDOM_SEED = 42
 
+# 配当利回りの異常値ガード（2026-08-10発覚・全銘柄の分割履歴を確認して追加）:
+# bot/irbank_dividend.adjust_dividends_for_splits()は「1期の途中で分割が起きる」ケース
+# （分割前の中間配当＋分割後の期末配当が単純合算される）を正しく補正できず、実際にはあり得ない
+# 極端な利回りを生むことがある。全16銘柄の分割履歴を確認したところ、伊藤忠(1件)だけでなく
+# KDDI（2012年1:100分割＋2013年1:2分割の連続、2013-05〜2015-05の2年間・490日にわたり
+# 最大204.9%という利回りが混入）、東京海上HD・NTT・三菱商事・JTでも同種の異常が確認された
+# （data_cache/irbank_dividend_history.jsonとdata_cache/yfinance_prices/*.csvのStock Splits列を
+# 突き合わせて検出。全16銘柄中816/63892日=1.28%が該当）。
+# この関数はcheck_signal.py・backtest_dividend_relative_yield_filter.py双方から共有されるため、
+# ここで一箇所にガードを入れることで両方に自動的に効く。
+YIELD_OUTLIER_CEILING_PCT = 8.0  # コア16銘柄の実勢利回り（軒並み1〜5%程度）から見て十分に非現実的な水準
+
 # ウォークフォワード用の暦年ウィンドウ（backtest_walkforward_threshold.pyと同じ非重複ウィンドウ方式）
 WALKFORWARD_YEARS = list(range(2011, 2024))  # 5年後リターンが計算可能な範囲を考慮し2023年までに限定
 
@@ -86,6 +98,7 @@ def build_dividend_yield_series(div_periods_raw: list[dict], price_df: pd.DataFr
 
     dps_series = pd.Series(dps_vals, index=price_df.index, dtype="float64")
     yield_pct = dps_series / price_df["Close"] * 100
+    yield_pct[yield_pct > YIELD_OUTLIER_CEILING_PCT] = float("nan")  # 分割またぎ等の異常値ガード
     return yield_pct
 
 
