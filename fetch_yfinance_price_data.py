@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 
 import yfinance as yf
+from curl_cffi.const import CurlHttpVersion
+from curl_cffi.requests import Session as CurlCffiSession
 
 from universe import CORE16_UNIVERSE
 
@@ -32,6 +34,15 @@ START_DATE = "2010-01-01"
 END_DATE = None  # Noneなら最新日まで
 REQUEST_INTERVAL_SEC = 1.5  # 銘柄間の最低待機時間
 OUTPUT_DIR = Path(__file__).parent / "data_cache" / "yfinance_prices"
+
+# 2026-08-13: クラウドルーティン環境（core16-signal-check、egressがプロキシ経由）で
+# yfinance既定のcurl_cffiセッション（HTTP/2でブラウザTLS偽装）がConnection resetで
+# 全銘柄失敗する障害が発生。curl_cffi公式FAQでも「プロキシ経由時のHTTP/2ストリーム
+# エラーはHTTP/1.1固定が有効な対処」とされており、このセッションのbashサンドボックス
+# （プロキシなし）ではHTTP/1.1固定でも従来通り正常取得できることを確認済み。
+# ローカル環境（プロキシなし）への副作用は無い前提でHTTP/1.1固定のセッションを明示的に
+# 生成しyf.Tickerへ渡す。
+_yf_session = CurlCffiSession(impersonate="chrome", http_version=CurlHttpVersion.V1_1)
 
 # 2010年からの取得を想定した場合の最低営業日数の目安（15年分なら3000日超が普通）。
 # これを大きく下回る場合は取得漏れ・上場が新しい等を疑って警告する。
@@ -48,12 +59,12 @@ def main() -> int:
         code, name, symbol = ticker["code"], ticker["name"], ticker["yfinance_symbol"]
         print(f"[{i + 1}/{len(CORE16_UNIVERSE)}] {code} {name} ({symbol}) を取得中...")
         try:
-            df = yf.Ticker(symbol).history(
+            df = yf.Ticker(symbol, session=_yf_session).history(
                 start=START_DATE, end=END_DATE, auto_adjust=False, actions=True
             )
         except Exception as e:  # noqa: BLE001 - 1銘柄の失敗で全体を止めず、最後に一覧報告する
-            print(f"  失敗（例外）: {e}")
-            failures.append((code, name, str(e)))
+            print(f"  失敗（例外・{type(e).__name__}）: {e}")
+            failures.append((code, name, f"{type(e).__name__}: {e}"))
             continue
 
         if df.empty:
