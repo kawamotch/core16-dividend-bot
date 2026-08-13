@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 
 import yfinance as yf
-from curl_cffi.const import CurlHttpVersion
 from curl_cffi.requests import Session as CurlCffiSession
 
 from universe import CORE16_UNIVERSE
@@ -35,14 +34,15 @@ END_DATE = None  # Noneなら最新日まで
 REQUEST_INTERVAL_SEC = 1.5  # 銘柄間の最低待機時間
 OUTPUT_DIR = Path(__file__).parent / "data_cache" / "yfinance_prices"
 
-# 2026-08-13: クラウドルーティン環境（core16-signal-check、egressがプロキシ経由）で
-# yfinance既定のcurl_cffiセッション（HTTP/2でブラウザTLS偽装）がConnection resetで
-# 全銘柄失敗する障害が発生。curl_cffi公式FAQでも「プロキシ経由時のHTTP/2ストリーム
-# エラーはHTTP/1.1固定が有効な対処」とされており、このセッションのbashサンドボックス
-# （プロキシなし）ではHTTP/1.1固定でも従来通り正常取得できることを確認済み。
-# ローカル環境（プロキシなし）への副作用は無い前提でHTTP/1.1固定のセッションを明示的に
-# 生成しyf.Tickerへ渡す。
-_yf_session = CurlCffiSession(impersonate="chrome", http_version=CurlHttpVersion.V1_1)
+# 2026-08-13: クラウドルーティン環境（core16-signal-check、egressがTLS検査プロキシ経由）で
+# yfinance既定のcurl_cffiセッション（impersonate="chrome"）が全銘柄Connection resetで
+# 失敗する障害が発生。diagnose_yfinance_network.pyでの切り分けの結果、HTTP/2やTLS証明書
+# 信頼（verify）は無関係（verify=Falseでも同じ失敗）で、"chrome"偽装のTLS ClientHelloだけが
+# その環境のプロキシと相性が悪く一貫してリセットされることを確認。"safari15_5"偽装・
+# 無偽装はどちらも同環境で200 OKだった。Yahoo側のボット判定を通すには何らかのブラウザ
+# 偽装が必要（無偽装は429 Too Many Requestsで弾かれる）ため、"safari15_5"を採用する。
+# このセッションのbashサンドボックス（プロキシなし環境）でも16/16銘柄取得成功を確認済み。
+_yf_session = CurlCffiSession(impersonate="safari15_5")
 
 # 2010年からの取得を想定した場合の最低営業日数の目安（15年分なら3000日超が普通）。
 # これを大きく下回る場合は取得漏れ・上場が新しい等を疑って警告する。
