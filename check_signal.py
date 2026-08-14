@@ -134,23 +134,24 @@ def main() -> int:
     is_first_run = last_checked is None
     print(f"前回チェック日: {last_checked or '(初回)'}")
 
+    # 2026-08-14: IRBANK利用規約（第9条2項・第13条）が自動化ツール・スクレイパーによる
+    # データ取得を明確に禁止していることが判明したため、fetch_pbr_range_data.py・
+    # fetch_dividend_history_data.py（いずれもIRBANKへのrequestsスクレイピング）の
+    # 自動再実行トリガーを撤去した（review-panel承認済み、代替データソースEDINET APIへの
+    # 移行を計画中）。キャッシュが古くなっても自動取得はせず、警告表示のみにとどめ、
+    # 既存キャッシュで判定を続行する。手動更新が必要な場合は、規約上の位置付けを再確認した
+    # 上でユーザーの判断でfetch_pbr_range_data.py等を個別実行すること。
     if _cache_file_is_stale(PBR_RANGE_PATH):
-        ok = _run_fetch_script("fetch_pbr_range_data.py")
-        if not ok:
-            print("PBRレンジデータの取得に一部失敗しましたが、既存キャッシュで続行します。")
+        print("警告: PBRレンジデータが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
     else:
-        print("PBRレンジデータは十分新しいため再取得をスキップ。")
+        print("PBRレンジデータは十分新しいため再取得不要。")
 
     _run_fetch_script("fetch_yfinance_price_data.py")
 
-    # 配当データ取得はfetch_yfinance_price_data.pyが保存する分割情報(Stock Splits列)に
-    # 依存するため、必ず株価取得の後に実行する
     if _cache_file_is_stale(DIVIDEND_HISTORY_PATH):
-        ok = _run_fetch_script("fetch_dividend_history_data.py")
-        if not ok:
-            print("配当データの取得に一部失敗しましたが、既存キャッシュ（無ければ利回り判定なし）で続行します。")
+        print("警告: 配当データが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
     else:
-        print("配当データは十分新しいため再取得をスキップ。")
+        print("配当データは十分新しいため再取得不要。")
 
     print("\nシグナルを計算中...")
     signals = _compute_all_signals()
