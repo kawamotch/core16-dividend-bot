@@ -6,6 +6,13 @@
 「前回チェック以降に新しく閾値30%以下（割安ゾーン）に入った銘柄」をまとめて報告する
 （ユーザーが毎日聞くとは限らないため、空白期間はキャッチアップする設計）。
 
+【Phase C（2026-08-17、13人フルレビューでGo判定・ユーザー承認済み）】
+判定方式をIRBANKからEDINETへ切り替えた（`USE_EDINET_METHOD`フラグ）。移行動機はエッジ改善では
+なくIRBANK利用規約違反リスクの解消（tasks/handoff_archive.md 2026-08-14参照）。切替前の
+段階的検証（4本のバックテストを新旧両方式で再実行・比較）はtasks/handoff_archive.md /
+tasks/handoff_next_session.mdの2026-08-16・08-17セクション参照。旧IRBANK経路はロールバック用に
+削除せずそのまま残してある（`USE_EDINET_METHOD = False`に戻せば即座に旧方式へ復帰できる）。
+
 実行の流れ:
 1. data_cache/last_check_state.json から前回チェック日を読む（無ければ「今回が初回」扱い）
 2. PBRレンジデータ・配当データ（IRBANK）が古ければ（STALENESS_DAYS超）再取得、株価データは
@@ -41,6 +48,9 @@ import pandas as pd
 from bot.pbr_signal import build_period_records, compute_daily_signal
 from backtest_holding_drawdown import _buy_events, THRESHOLD_PCT
 from backtest_dividend_yield_filter import build_dividend_yield_series, YIELD_THRESHOLD_PCT
+from backtest_dividend_yield_filter_edinet import build_dividend_yield_series_edinet
+from compute_edinet_pbr_range import EDINET_DATA_PATH, _load_price_df
+from edinet_signal_adapter import compute_daily_signal_edinet
 from universe import CORE16_UNIVERSE
 
 DATA_CACHE = Path(__file__).parent / "data_cache"
@@ -48,6 +58,10 @@ STATE_PATH = DATA_CACHE / "last_check_state.json"
 PBR_RANGE_PATH = DATA_CACHE / "irbank_pbr_range.json"
 DIVIDEND_HISTORY_PATH = DATA_CACHE / "irbank_dividend_history.json"
 STALENESS_DAYS = 25  # PBR/配当レンジデータ（四半期更新）を再取得しなおすまでの許容日数
+
+# Phase C切替フラグ。Trueなら新方式(EDINET)、Falseなら旧方式(IRBANK)。
+# 上記モジュールdocstring「Phase C」参照。ロールバックはこの1行をFalseに戻すだけでよい。
+USE_EDINET_METHOD = True
 
 # 配当利回りの異常値ガード（分割またぎ等でのデータ異常対策）は、build_dividend_yield_series()
 # （backtest_dividend_yield_filter.py、YIELD_OUTLIER_CEILING_PCT）側に一本化済み（2026-08-10）。
@@ -82,6 +96,15 @@ def _cache_file_is_stale(path: Path) -> bool:
     return age > timedelta(days=STALENESS_DAYS)
 
 
+def _file_is_stale_by_mtime(path: Path) -> bool:
+    """fetched_atメタデータを持たないファイル用（edinet_financial_data.jsonはトップレベルに
+    fetched_at相当のフィールドを持たないため、ファイルのmtimeで代用する）。"""
+    if not path.exists():
+        return True
+    age = datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return age > timedelta(days=STALENESS_DAYS)
+
+
 def _run_fetch_script(script_name: str) -> bool:
     print(f"--- {script_name} を実行中 ---")
     result = subprocess.run([sys.executable, script_name], cwd=Path(__file__).parent)
@@ -89,9 +112,51 @@ def _run_fetch_script(script_name: str) -> bool:
 
 
 def _compute_all_signals() -> dict[str, pd.DataFrame]:
-    """レンジ位置(%)に加えて配当利回り(%)も計算する（dividend_yield_pct列）。
+    """USE_EDINET_METHODフラグに従い、新方式(EDINET)か旧方式(IRBANK)のいずれかで
+    レンジ位置(%)・配当利回り(%)を計算する（dividend_yield_pct列）。"""
+    if USE_EDINET_METHOD:
+        return _compute_all_signals_edinet()
+    return _compute_all_signals_irbank()
+
+
+def _compute_all_signals_edinet() -> dict[str, pd.DataFrame]:
+    """新方式（EDINET、Phase C・2026-08-17〜本番採用）。レンジ位置はedinet_signal_adapter
+    （BVPS自前計算＋yfinance日次終値、compute_edinet_pbr_range.pyのロジック）、配当利回りは
+    backtest_dividend_yield_filter_edinet.build_dividend_yield_series_edinet
+    （BVPSと同じ株式分割調整ロジックをdps_totalにも適用済み）で計算する。
     配当データが無い/取得失敗の銘柄でもレンジ位置側の判定は継続できるよう、
     利回り計算の失敗は個別にNaN扱いにしてスキップする（1銘柄の欠損で全体を止めない）。"""
+    edinet_data = json.loads(EDINET_DATA_PATH.read_text(encoding="utf-8"))
+
+    signals = {}
+    for ticker in CORE16_UNIVERSE:
+        code = ticker["code"]
+        price_path = DATA_CACHE / "yfinance_prices" / f"{code}.csv"
+        if not price_path.exists():
+            print(f"  警告: {code} {ticker['name']} の価格データが無い（取得失敗の可能性）。スキップ")
+            continue
+        try:
+            sig = compute_daily_signal_edinet(code)
+            if sig is None:
+                print(f"  警告: {code} {ticker['name']} のEDINETデータが不足のためレンジ計算不能。スキップ")
+                continue
+
+            try:
+                raw_price_df = _load_price_df(code)  # Close + Stock Splits（分割調整用）
+                sig["dividend_yield_pct"] = build_dividend_yield_series_edinet(code, edinet_data, raw_price_df).reindex(sig.index)
+            except Exception as e:  # noqa: BLE001 - 利回り計算の失敗はレンジ判定に影響させない
+                print(f"  警告: {code} {ticker['name']} の配当利回り計算に失敗: {e}（レンジ位置判定は継続）")
+                sig["dividend_yield_pct"] = float("nan")
+
+            signals[code] = sig
+        except Exception as e:  # noqa: BLE001 - 1銘柄の失敗で全体を止めない
+            print(f"  警告: {code} {ticker['name']} のシグナル計算に失敗: {e}。スキップ")
+    return signals
+
+
+def _compute_all_signals_irbank() -> dict[str, pd.DataFrame]:
+    """旧方式（IRBANK、Phase C以前の本番ロジック。ロールバック用に保持、
+    USE_EDINET_METHOD = False で再び有効になる）。"""
     with open(PBR_RANGE_PATH, encoding="utf-8") as f:
         pbr_data = json.load(f)
 
@@ -137,21 +202,29 @@ def main() -> int:
     # 2026-08-14: IRBANK利用規約（第9条2項・第13条）が自動化ツール・スクレイパーによる
     # データ取得を明確に禁止していることが判明したため、fetch_pbr_range_data.py・
     # fetch_dividend_history_data.py（いずれもIRBANKへのrequestsスクレイピング）の
-    # 自動再実行トリガーを撤去した（review-panel承認済み、代替データソースEDINET APIへの
-    # 移行を計画中）。キャッシュが古くなっても自動取得はせず、警告表示のみにとどめ、
-    # 既存キャッシュで判定を続行する。手動更新が必要な場合は、規約上の位置付けを再確認した
-    # 上でユーザーの判断でfetch_pbr_range_data.py等を個別実行すること。
-    if _cache_file_is_stale(PBR_RANGE_PATH):
-        print("警告: PBRレンジデータが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
+    # 自動再実行トリガーを撤去した。EDINET側もPhase D（クラウド環境への自動再取得復活、要許可）
+    # 未実装のため、いずれの方式でもキャッシュが古くなっても自動取得はせず、警告表示のみに
+    # とどめ既存キャッシュで判定を続行する。手動更新が必要な場合はユーザーの判断で
+    # fetch_edinet_financial_data.py（EDINET方式）またはfetch_pbr_range_data.py等
+    # （IRBANK方式、規約上の位置付けに要注意）を個別実行すること。
+    if USE_EDINET_METHOD:
+        if _file_is_stale_by_mtime(EDINET_DATA_PATH):
+            print("警告: EDINET財務データが古くなっています（自動再取得は未実装、既存キャッシュで続行）。")
+        else:
+            print("EDINET財務データは十分新しいため再取得不要。")
     else:
-        print("PBRレンジデータは十分新しいため再取得不要。")
+        if _cache_file_is_stale(PBR_RANGE_PATH):
+            print("警告: PBRレンジデータが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
+        else:
+            print("PBRレンジデータは十分新しいため再取得不要。")
 
     _run_fetch_script("fetch_yfinance_price_data.py")
 
-    if _cache_file_is_stale(DIVIDEND_HISTORY_PATH):
-        print("警告: 配当データが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
-    else:
-        print("配当データは十分新しいため再取得不要。")
+    if not USE_EDINET_METHOD:
+        if _cache_file_is_stale(DIVIDEND_HISTORY_PATH):
+            print("警告: 配当データが古くなっています（IRBANK自動再取得は無効化済み、既存キャッシュで続行）。")
+        else:
+            print("配当データは十分新しいため再取得不要。")
 
     print("\nシグナルを計算中...")
     signals = _compute_all_signals()
@@ -160,10 +233,12 @@ def main() -> int:
         return 1
 
     today_str = None
-    # (code, name, date, range_position_pct, dividend_yield_pct_or_None, and_condition_met)
-    new_events: list[tuple[str, str, pd.Timestamp, float, float | None, bool]] = []
-    # (code, name, current_range_position_pct, current_dividend_yield_pct_or_None)
-    current_status: list[tuple[str, str, float | None, float | None]] = []
+    # (code, name, date, range_position_pct, dividend_yield_pct_or_None, and_condition_met,
+    #  current_pbr, range_high_pbr, range_low_pbr)
+    new_events: list[tuple[str, str, pd.Timestamp, float, float | None, bool, float, float, float]] = []
+    # (code, name, current_range_position_pct, current_dividend_yield_pct_or_None,
+    #  current_pbr, range_high_pbr, range_low_pbr)
+    current_status: list[tuple[str, str, float | None, float | None, float | None, float | None, float | None]] = []
 
     name_by_code = {t["code"]: t["name"] for t in CORE16_UNIVERSE}
 
@@ -174,19 +249,25 @@ def main() -> int:
     for code, sig in signals.items():
         valid = sig.dropna(subset=["range_position_pct"])
         if valid.empty:
-            current_status.append((code, name_by_code[code], None, None))
+            current_status.append((code, name_by_code[code], None, None, None, None, None))
             continue
         today_str = str(valid.index[-1].date())
         today_yield = _clean_yield(sig["dividend_yield_pct"].loc[valid.index[-1]])
-        current_status.append((code, name_by_code[code], float(valid["range_position_pct"].iloc[-1]), today_yield))
+        current_status.append((
+            code, name_by_code[code], float(valid["range_position_pct"].iloc[-1]), today_yield,
+            float(valid["current_pbr"].iloc[-1]), float(valid["range_high"].iloc[-1]), float(valid["range_low"].iloc[-1]),
+        ))
 
         events = _buy_events(sig, THRESHOLD_PCT)
 
-        def _event_row(ev_date: pd.Timestamp) -> tuple[str, str, pd.Timestamp, float, float | None, bool]:
+        def _event_row(ev_date: pd.Timestamp) -> tuple[str, str, pd.Timestamp, float, float | None, bool, float, float, float]:
             range_pct = float(valid["range_position_pct"].loc[ev_date])
             yield_pct = _clean_yield(sig["dividend_yield_pct"].loc[ev_date])
             and_met = yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT
-            return (code, name_by_code[code], ev_date, range_pct, yield_pct, and_met)
+            pbr = float(valid["current_pbr"].loc[ev_date])
+            range_high = float(valid["range_high"].loc[ev_date])
+            range_low = float(valid["range_low"].loc[ev_date])
+            return (code, name_by_code[code], ev_date, range_pct, yield_pct, and_met, pbr, range_high, range_low)
 
         if is_first_run:
             # 初回は「今日時点で既にゾーン内か」だけを見る（過去16年分を一括報告しない）
@@ -207,24 +288,28 @@ def main() -> int:
     and_events = [e for e in new_events if e[5]]
     other_events = [e for e in new_events if not e[5]]
 
+    def _fmt_pbr_detail(pbr: float, range_high: float, range_low: float) -> str:
+        return f"PBR={pbr:.2f}（10年最高={range_high:.2f}/最安={range_low:.2f}）"
+
     print(f"\n=== 割安シグナル（閾値{THRESHOLD_PCT}%以下、前回チェック以降の新規分） ===")
     if and_events:
         print(f"  ▼特に有望（レンジ{THRESHOLD_PCT}%以下 かつ 利回り{YIELD_THRESHOLD_PCT}%以上、OOS検証で優位性確認済み）")
-        for code, name, date, pct, yield_pct, _ in sorted(and_events, key=lambda x: x[3]):
-            print(f"    {date.date()}  {code} {name}  レンジ位置={pct:.1f}%  {_fmt_yield(yield_pct)}")
+        for code, name, date, pct, yield_pct, _, pbr, range_high, range_low in sorted(and_events, key=lambda x: x[3]):
+            print(f"    {date.date()}  {code} {name}  レンジ位置={pct:.1f}%  {_fmt_yield(yield_pct)}  {_fmt_pbr_detail(pbr, range_high, range_low)}")
     if other_events:
         print(f"  ▼レンジ条件のみ成立（利回り{YIELD_THRESHOLD_PCT}%未満、または利回りデータ不明）")
-        for code, name, date, pct, yield_pct, _ in sorted(other_events, key=lambda x: x[3]):
-            print(f"    {date.date()}  {code} {name}  レンジ位置={pct:.1f}%  {_fmt_yield(yield_pct)}")
+        for code, name, date, pct, yield_pct, _, pbr, range_high, range_low in sorted(other_events, key=lambda x: x[3]):
+            print(f"    {date.date()}  {code} {name}  レンジ位置={pct:.1f}%  {_fmt_yield(yield_pct)}  {_fmt_pbr_detail(pbr, range_high, range_low)}")
     if not new_events:
         print("  新規シグナルなし")
 
     print(f"\n=== 現在のレンジ位置・配当利回り（全16銘柄、参考） ===")
-    for code, name, pct, yield_pct in sorted(current_status, key=lambda x: (x[2] is None, x[2] if x[2] is not None else 999)):
+    for code, name, pct, yield_pct, pbr, range_high, range_low in sorted(current_status, key=lambda x: (x[2] is None, x[2] if x[2] is not None else 999)):
         pct_str = f"{pct:.1f}%" if pct is not None else "算出不能"
+        pbr_str = _fmt_pbr_detail(pbr, range_high, range_low) if pbr is not None else "PBR算出不能"
         and_met = pct is not None and pct <= THRESHOLD_PCT and yield_pct is not None and yield_pct >= YIELD_THRESHOLD_PCT
         marker = " ★★AND条件成立" if and_met else (" ★割安ゾーン" if pct is not None and pct <= THRESHOLD_PCT else "")
-        print(f"  {code} {name:10s}  レンジ={pct_str:>7}  {_fmt_yield(yield_pct):>10}{marker}")
+        print(f"  {code} {name:10s}  レンジ={pct_str:>7}  {_fmt_yield(yield_pct):>10}  {pbr_str}{marker}")
 
     if today_str:
         _save_last_checked_date(today_str)
